@@ -1,0 +1,139 @@
+#!/usr/bin/python3
+"""RAM Reduct privileged helper. Runs as root via pkexec.
+  ramreduct-helper --serve        line protocol on stdin/stdout (used by the GUI)
+  ramreduct-helper clean [cpms]   one-shot from a terminal
+Flags: c = drop page cache/dentries/inodes, p = trim process memory (MADV_PAGEOUT),
+       m = compact memory, s = cycle swap devices (only if enough free RAM)."""
+import os, sys, time, ctypes, subprocess
+
+SYS_PIDFD_OPEN, SYS_PROCESS_MADVISE, MADV_PAGEOUT = 434, 440, 21
+SKIP = ("[vvar]", "[vdso]", "[vsyscall]", "[vvar_vclock]", "[uprobes]")
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+
+class IoVec(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+def meminfo():
+    d = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":")
+            d[k] = int(v.split()[0]) * 1024
+    return d
+
+def write_proc(path, val):
+    with open(path, "w") as f:
+        f.write(val)
+
+def pageout_all(deadline):
+    """Ask the kernel to reclaim (swap out / drop) private pages of every process."""
+    me, total, procs = os.getpid(), 0, 0
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or time.time() > deadline:
+            continue
+        pid = int(name)
+        if pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/maps") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        if not lines:
+            continue
+        fd = libc.syscall(ctypes.c_long(SYS_PIDFD_OPEN), ctypes.c_long(pid), ctypes.c_long(0))
+        if fd < 0:
+            continue
+        try:
+            for ln in lines:
+                p = ln.split(None, 5)
+                if len(p) < 2 or len(p[1]) < 4 or p[1][3] != "p" or p[1][0] != "r":
+                    continue
+                if len(p) > 5 and p[5].strip() in SKIP:
+                    continue
+                a, b = p[0].split("-")
+                start = int(a, 16)
+                length = int(b, 16) - start
+                if length <= 0:
+                    continue
+                iov = IoVec(start, length)
+                r = libc.syscall(ctypes.c_long(SYS_PROCESS_MADVISE), ctypes.c_long(fd),
+                                 ctypes.byref(iov), ctypes.c_long(1),
+                                 ctypes.c_long(MADV_PAGEOUT), ctypes.c_long(0))
+                if r > 0:
+                    total += r
+        finally:
+            os.close(fd)
+        procs += 1
+    return total, procs
+
+def cycle_swap():
+    m = meminfo()
+    used = m.get("SwapTotal", 0) - m.get("SwapFree", 0)
+    if used <= 0:
+        return "swap already empty"
+    if m["MemAvailable"] < used * 1.1 + 300 * 1024 * 1024:
+        return "swap skipped (not enough free RAM)"
+    with open("/proc/swaps") as f:
+        rows = [l.split() for l in f.read().splitlines()[1:]]
+    for r in rows:
+        dev, prio = r[0], r[4]
+        subprocess.run(["swapoff", dev], check=True)
+        subprocess.run(["swapon", "-p", prio, dev], check=True)
+    return "swap cycled"
+
+def do_clean(flags):
+    msgs, deadline = [], time.time() + 25
+    try:
+        os.sync()
+    except OSError:
+        pass
+    if "c" in flags:
+        try:
+            write_proc("/proc/sys/vm/drop_caches", "3"); msgs.append("cache dropped")
+        except OSError as e:
+            msgs.append(f"cache failed: {e}")
+    if "p" in flags:
+        try:
+            n, procs = pageout_all(deadline)
+            msgs.append(f"trimmed {procs} processes ({n >> 20} MB)")
+        except Exception as e:
+            msgs.append(f"trim failed: {e}")
+    if "m" in flags:
+        try:
+            write_proc("/proc/sys/vm/compact_memory", "1"); msgs.append("compacted")
+        except OSError as e:
+            msgs.append(f"compact failed: {e}")
+    if "s" in flags:
+        try:
+            msgs.append(cycle_swap())
+        except Exception as e:
+            msgs.append(f"swap failed: {e}")
+    return "; ".join(msgs) or "nothing to do"
+
+def main():
+    if os.geteuid() != 0:
+        print("must run as root"); sys.exit(1)
+    if len(sys.argv) > 1 and sys.argv[1] == "--serve":
+        print("READY", flush=True)
+        for line in sys.stdin:
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] == "quit":
+                break
+            if parts[0] == "clean":
+                try:
+                    out = do_clean(parts[1] if len(parts) > 1 else "")
+                except Exception as e:
+                    out = f"error: {e}"
+                print("DONE " + out, flush=True)
+    elif len(sys.argv) > 1 and sys.argv[1] == "clean":
+        print(do_clean(sys.argv[2] if len(sys.argv) > 2 else "cpm"))
+    else:
+        print(__doc__)
+
+if __name__ == "__main__":
+    main()

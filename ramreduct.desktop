@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RAM Reduct
+Comment=Free up system memory
+Exec=ramreduct
+Icon=ramreduct
+Terminal=false
+Categories=System;Utility;Monitor;
